@@ -1,11 +1,16 @@
 # Changelog
 
+## Pending 3.0
+
+### Breaking Changes
+
+* Core: An atomic batch that the server aborts with `EXECABORT`, because a command was rejected while queuing, now fails with an `ExecAbort` error instead of a `RequestError` with the rejected command's error. The message still includes that error ([#7654](https://github.com/valkey-io/valkey-glide/issues/7654))
+
 ## Pending 2.7
 
 ### Fixes
 
 * Core: reinit the global timeout watchdog in forked children ([#7569](https://github.com/valkey-io/valkey-glide/pull/7569))
-* Core: Return an `ExecAbort` error when the server aborts an atomic batch because a queued command was rejected ([#7654](https://github.com/valkey-io/valkey-glide/issues/7654))
 
 ## 2.6
 
