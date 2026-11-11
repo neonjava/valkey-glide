@@ -211,10 +211,10 @@ class TestBatch:
             else ClusterBatch(is_atomic=True)
         )
         transaction.custom_command(["WATCH", key])
-        with pytest.raises(RequestError) as e:
+        with pytest.raises(ExecAbortError) as e:
             await exec_batch(glide_client, transaction)
 
-        assert "not allowed" in str(e)  # TODO : add an assert on EXEC ABORT
+        assert "not allowed" in str(e)
 
     @pytest.mark.parametrize("cluster_mode", [True, False])
     @pytest.mark.parametrize("protocol", [ProtocolVersion.RESP2, ProtocolVersion.RESP3])
