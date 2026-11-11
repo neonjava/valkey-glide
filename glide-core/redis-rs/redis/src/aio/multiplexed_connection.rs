@@ -8,7 +8,10 @@ use crate::cmd::Cmd;
 use crate::parser::ValueCodec;
 use crate::pipeline::PipelineRetryStrategy;
 use crate::push_manager::PushManager;
-use crate::types::{RedisError, RedisFuture, RedisResult, Value};
+use crate::types::{
+    ErrorKind, RedisError, RedisFuture, RedisResult, RetryMethod, ServerError, Value,
+    SERVER_ERROR_DESCRIPTION,
+};
 use crate::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -237,6 +240,20 @@ impl ResponseAggregate {
     }
 }
 
+/// Builds the error for a transaction that the server aborted with `EXECABORT`, adding the error
+/// of the queued command that caused the abort.
+fn exec_abort_error(exec_abort: ServerError, queued_err: &RedisError) -> RedisError {
+    let queued_reason = match (queued_err.code(), queued_err.detail()) {
+        (Some(code), Some(detail)) => format!("{code} {detail}"),
+        _ => queued_err.to_string(),
+    };
+    let detail = match exec_abort.details() {
+        Some(exec_detail) => format!("{exec_detail} First error: {queued_reason}"),
+        None => format!("First error: {queued_reason}"),
+    };
+    RedisError::from((ErrorKind::ExecAbortError, SERVER_ERROR_DESCRIPTION, detail))
+}
+
 struct InFlight {
     output: PipelineOutput,
     response_aggregate: ResponseAggregate,
@@ -440,12 +457,19 @@ where
                 match result {
                     Ok(Value::ServerError(err)) if *is_transaction => {
                         // In transactions, `count` is always 1 because the final result is a single array (`offset + count = expected_response_count`).
-                        // If we receive a `ServerError` here, it means the error occurred between `MULTI` and `EXEC`.
-                        // After `EXEC`, the response is always a single array of results, so any error at this stage must have happened before `EXEC` was sent.
-                        // As a result, the entire transaction will be discarded (and can be retried).
-                        if first_err.is_none() {
-                            *first_err = Some(err.into());
-                        }
+                        // A `ServerError` here is a command rejected between `MULTI` and `EXEC`, which makes the server discard
+                        // the entire transaction (so it can be retried), or the `EXECABORT` reply to `EXEC` that follows it.
+                        *first_err = Some(match first_err.take() {
+                            None => err.into(),
+                            // Keep an error that callers act on, e.g. a cluster redirect that resends the transaction.
+                            Some(queued_err)
+                                if err.kind() == ErrorKind::ExecAbortError
+                                    && queued_err.retry_method() == RetryMethod::NoRetry =>
+                            {
+                                exec_abort_error(err, &queued_err)
+                            }
+                            Some(queued_err) => queued_err,
+                        });
                     }
                     Ok(item) => {
                         buffer.push(item);
@@ -1632,6 +1656,83 @@ mod tests {
         );
 
         driver.abort();
+    }
+
+    /// Sends `MULTI`, two `SET`s and `EXEC` as an atomic pipeline, where the server rejects the
+    /// first `SET` with `queued_error` and then aborts `EXEC`, and returns the pipeline's result.
+    async fn aborted_transaction_result(queued_error: ServerError) -> RedisResult<Vec<Value>> {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (mut response_tx, response_rx) = futures_mpsc::channel(4);
+        let sink = ResponseSink {
+            command_tx,
+            response_rx,
+        };
+        let (pipeline, driver) = Pipeline::new(sink, None, None);
+        let driver = tokio::spawn(driver);
+        let connection = MultiplexedConnection::builder(pipeline)
+            .build()
+            .await
+            .unwrap();
+
+        let mut transaction = crate::pipe();
+        transaction.atomic();
+        transaction.cmd("SET").arg("key");
+        transaction.cmd("SET").arg("key").arg("value");
+        let request = tokio::spawn(async move {
+            let mut connection = connection;
+            connection
+                .send_packed_commands(&transaction, transaction.len() + 1, 1)
+                .await
+        });
+        command_rx.recv().await.expect("transaction must be sent");
+
+        response_tx.try_send(Ok(Value::Okay)).unwrap();
+        response_tx
+            .try_send(Ok(Value::ServerError(queued_error)))
+            .unwrap();
+        response_tx
+            .try_send(Ok(Value::SimpleString("QUEUED".to_string())))
+            .unwrap();
+        response_tx
+            .try_send(Ok(Value::ServerError(ServerError::KnownError {
+                kind: crate::types::ServerErrorKind::ExecAbortError,
+                detail: Some("Transaction discarded because of previous errors.".to_string()),
+            })))
+            .unwrap();
+
+        let result = request.await.unwrap();
+        driver.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn test_transaction_aborted_by_queued_error_returns_exec_abort() {
+        let err = aborted_transaction_result(ServerError::KnownError {
+            kind: crate::types::ServerErrorKind::ResponseError,
+            detail: Some("wrong number of arguments for 'set' command".to_string()),
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), crate::ErrorKind::ExecAbortError, "{err}");
+        assert!(
+            err.to_string()
+                .contains("ERR wrong number of arguments for 'set' command"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transaction_aborted_by_redirect_returns_redirect() {
+        // The cluster client redirects and resends the transaction based on this error.
+        let err = aborted_transaction_result(ServerError::KnownError {
+            kind: crate::types::ServerErrorKind::Moved,
+            detail: Some("1234 127.0.0.1:6380".to_string()),
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), crate::ErrorKind::Moved, "{err}");
     }
 
     #[tokio::test]

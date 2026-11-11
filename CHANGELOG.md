@@ -5,6 +5,7 @@
 ### Fixes
 
 * Core: reinit the global timeout watchdog in forked children ([#7569](https://github.com/valkey-io/valkey-glide/pull/7569))
+* Core: Return an `ExecAbort` error when the server aborts an atomic batch because a queued command was rejected ([#7654](https://github.com/valkey-io/valkey-glide/issues/7654))
 
 ## 2.6
 

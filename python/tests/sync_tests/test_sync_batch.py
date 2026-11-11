@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from typing import List, Optional, Union, cast
 
 import pytest
-from glide_shared import RequestError, TimeoutError
+from glide_shared import ExecAbortError, RequestError, TimeoutError
 from glide_shared.commands.batch import (
     BaseBatch,
     Batch,
@@ -224,11 +224,9 @@ class TestSyncBatch:
         key = get_random_string(10)
         transaction = BaseBatch(is_atomic=True)
         transaction.custom_command(["INCR", key, key, key])
-        with pytest.raises(RequestError) as e:
+        with pytest.raises(ExecAbortError) as e:
             exec_batch(glide_sync_client, transaction)
-        assert "wrong number of arguments" in str(
-            e
-        )  # TODO : add an assert on EXEC ABORT
+        assert "wrong number of arguments" in str(e)
 
     @pytest.mark.parametrize("cluster_mode", [True])
     @pytest.mark.parametrize("is_atomic", [True, False])

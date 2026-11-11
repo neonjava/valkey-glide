@@ -121,6 +121,37 @@ async fn error_inside_transaction_runtime() {
 }
 
 #[tokio::test]
+async fn error_inside_transaction_queue_time() {
+    let server = common::TestServer::start();
+    let c = server.client().await;
+    let k = common::key("tx");
+
+    // A command rejected while queuing makes the server discard the whole transaction
+    // (`EXECABORT`), whatever `raise_on_error` is.
+    for raise_on_error in [true, false] {
+        let mut p = pipe();
+        p.atomic().cmd("SET").arg(&k); // missing value: rejected at queue time
+        p.cmd("SET").arg(&k).arg("v");
+
+        let err = c
+            .exec(&p, raise_on_error, &PipelineOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, glide::GlideError::ExecAbort(_)),
+            "raise_on_error={raise_on_error}: {err:?}"
+        );
+        assert!(
+            err.message().contains("wrong number of arguments"),
+            "raise_on_error={raise_on_error}: {err:?}"
+        );
+    }
+
+    let value: Option<String> = c.get(&k).await.unwrap();
+    assert_eq!(value, None, "no command of the aborted transaction runs");
+}
+
+#[tokio::test]
 async fn raw_commands_in_pipeline() {
     let server = common::TestServer::start();
     let c = server.client().await;
